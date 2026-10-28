@@ -15,6 +15,7 @@ import {
 import { fetchJson, throwIfAborted, type LoadOptions, type ModelPath } from '../../load.ts';
 import type { DecoderConfig, Json } from '../../decoder/config.ts';
 import { loadDecoderEngine, MAX_BURST, type DecoderEngine } from '../../decoder/engine.ts';
+import { rng, sampleToken } from '../../decoder/sampling.ts';
 import {
   createTextTokenizer,
   type ChatMessage,
@@ -147,86 +148,19 @@ export interface TextGenerator {
 const abortError = (signal: AbortSignal): unknown =>
   signal.reason ?? new DOMException('generation aborted', 'AbortError');
 
-/** mulberry32. */
-function rng(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/** Picks the next token from (already processed) logits. */
-function sampleToken(
-  logits: Float32Array,
-  candidates: readonly number[] | undefined,
-  temperature: number,
-  topK: number,
-  topP: number,
-  random: () => number,
-): number {
-  const n = candidates ? candidates.length : logits.length;
-  const idAt = candidates ? (i: number) => candidates[i]! : (i: number) => i;
-  if (temperature <= 0) {
-    let best = -1;
-    let bestV = -Infinity;
-    for (let i = 0; i < n; i++) {
-      const id = idAt(i);
-      const v = logits[id]!;
-      if (v > bestV) {
-        bestV = v;
-        best = id;
+/** Length of the longest end of `text` that a stop string starts with
+ *  (shorter than the whole stop string, which would have matched). */
+export function stopPrefixLength(text: string, stop: readonly string[] | undefined): number {
+  let n = 0;
+  for (const s of stop ?? []) {
+    for (let k = Math.min(s.length - 1, text.length); k > n; k--) {
+      if (text.endsWith(s.slice(0, k))) {
+        n = k;
+        break;
       }
     }
-    if (best < 0) throw new Error('generate: every token is masked');
-    return best;
   }
-  // Top-k by a small sorted buffer (k is small, V is large).
-  const k = Math.max(1, Math.min(topK, n));
-  const ids: number[] = [];
-  const vals: number[] = [];
-  for (let i = 0; i < n; i++) {
-    const id = idAt(i);
-    const v = logits[id]!;
-    if (v === -Infinity || Number.isNaN(v)) continue;
-    if (vals.length === k && v <= vals[k - 1]!) continue;
-    let j = vals.length === k ? k - 1 : vals.length;
-    if (vals.length < k) {
-      vals.push(v);
-      ids.push(id);
-    }
-    while (j > 0 && vals[j - 1]! < v) {
-      vals[j] = vals[j - 1]!;
-      ids[j] = ids[j - 1]!;
-      j--;
-    }
-    vals[j] = v;
-    ids[j] = id;
-  }
-  if (ids.length === 0) throw new Error('generate: every token is masked');
-  const max = vals[0]!;
-  const probs = vals.map((v) => Math.exp((v - max) / temperature));
-  const total = probs.reduce((a, b) => a + b, 0);
-  let cut = probs.length;
-  let acc = 0;
-  for (let i = 0; i < probs.length; i++) {
-    acc += probs[i]! / total;
-    if (acc >= topP) {
-      cut = i + 1;
-      break;
-    }
-  }
-  const kept = probs.slice(0, cut);
-  const keptTotal = kept.reduce((a, b) => a + b, 0);
-  let r = random() * keptTotal;
-  for (let i = 0; i < kept.length; i++) {
-    r -= kept[i]!;
-    if (r <= 0) return ids[i]!;
-  }
-  return ids[kept.length - 1]!;
+  return n;
 }
 
 /** Opens a safetensors file for byte-range reads, with the same network
@@ -377,6 +311,9 @@ export async function createTextGenerator(
     const t1 = performance.now();
     const generated: number[] = [];
     let text = '';
+    // Chars of `text` passed to onToken so far.
+    let streamed = 0;
+    let cutAtStop = false;
     let finishReason: GenerationStats['finishReason'] = 'length';
     let tFirst = t1;
     // Greedy with no CPU-side logit hooks: argmax on the GPU, in bursts.
@@ -418,17 +355,23 @@ export async function createTextGenerator(
             .map((s) => text.indexOf(s, Math.max(0, text.length - piece.length - s.length)))
             .filter((i) => i >= 0);
           if (hit.length > 0) {
-            const cut = Math.min(...hit);
-            const visible = piece.slice(0, Math.max(0, piece.length - (text.length - cut)));
-            if (visible) o.onToken?.(visible, tok);
-            text = text.slice(0, cut);
+            text = text.slice(0, Math.min(...hit));
+            cutAtStop = true;
+            if (text.length > streamed) o.onToken?.(text.slice(streamed), tok);
             finishReason = 'stop';
             break;
           }
         }
-        if (piece && o.onToken?.(piece, tok) === false) {
-          finishReason = 'callback';
-          break;
+        // Text that may begin a stop string waits until the next pieces
+        // settle it, so the streamed text always equals the returned one.
+        const upTo = text.length - stopPrefixLength(text, o.stop);
+        if (upTo > streamed) {
+          const out = text.slice(streamed, upTo);
+          streamed = upTo;
+          if (o.onToken?.(out, tok) === false) {
+            finishReason = 'callback';
+            break;
+          }
         }
         if (cached.length >= engine.maxContext) {
           finishReason = 'context';
@@ -450,7 +393,12 @@ export async function createTextGenerator(
           highWater = Math.max(highWater, cached.length);
         }
       }
-      text += stream.flush();
+      if (!cutAtStop) text += stream.flush();
+      const last = generated[generated.length - 1];
+      const streaming = finishReason !== 'callback' && finishReason !== 'aborted';
+      if (streaming && text.length > streamed && last !== undefined) {
+        o.onToken?.(text.slice(streamed), last);
+      }
     } finally {
       const t2 = performance.now();
       const n = generated.length;

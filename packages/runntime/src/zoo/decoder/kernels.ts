@@ -480,12 +480,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 `;
 
 /** Greedy argmax over the logits, pass 1: 256 workgroups each reduce a
- *  contiguous slice to (max, index); ties keep the lower index. */
+ *  contiguous slice to (max, index); ties keep the lower index. A partial is
+ *  stored as u32 bits: an index bitcast to f32 is subnormal below 2^23, and
+ *  WGSL lets an implementation flush those to zero. */
 export const ARGMAX1_WGSL = /* wgsl */ `
 ${STEP}
 struct P { V: u32, _a: u32, _b: u32, _c: u32 }
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
-@group(0) @binding(1) var<storage, read_write> part: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> part: array<vec2<u32>>;
 @group(0) @binding(2) var<uniform> p: P;
 @group(0) @binding(3) var<uniform> s: Step;
 var<workgroup> bv: array<f32, 256>;
@@ -512,7 +514,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     workgroupBarrier();
   }
-  if (li == 0u) { part[wg.x] = vec2<f32>(bv[0], bitcast<f32>(bi[0])); }
+  if (li == 0u) { part[wg.x] = vec2<u32>(bitcast<u32>(bv[0]), bi[0]); }
 }
 `;
 
@@ -520,7 +522,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
  *  the next step's input token and into the burst output at s.k. */
 export const ARGMAX2_WGSL = /* wgsl */ `
 ${STEP}
-@group(0) @binding(0) var<storage, read> part: array<vec2<f32>>;
+@group(0) @binding(0) var<storage, read> part: array<vec2<u32>>;
 @group(0) @binding(1) var<storage, read_write> ids: array<u32>;
 @group(0) @binding(2) var<storage, read_write> outIds: array<u32>;
 @group(0) @binding(3) var<uniform> s: Step;
@@ -529,8 +531,8 @@ var<workgroup> bi: array<u32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) li: u32) {
   let pv = part[li];
-  bv[li] = pv.x;
-  bi[li] = bitcast<u32>(pv.y);
+  bv[li] = bitcast<f32>(pv.x);
+  bi[li] = pv.y;
   workgroupBarrier();
   for (var st = 128u; st > 0u; st >>= 1u) {
     if (li < st) {
