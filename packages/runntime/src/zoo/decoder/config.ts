@@ -10,6 +10,8 @@
  *            full attention everywhere.
  *  Both use GQA with per-head q/k RMSNorm and rotate-half RoPE. */
 
+import { checkpointMismatch } from '../errors.ts';
+
 export type DecoderArch = 'gemma3' | 'qwen3';
 
 export interface DecoderConfig {
@@ -51,6 +53,6 @@ export function numReader(json: Json, family: string) {
     const v = json[key];
     if (typeof v === 'number') return v;
     if (fallback !== undefined) return fallback;
-    throw new Error(`${family} config: '${key}' missing or not a number`);
+    throw checkpointMismatch(`${family} config`, `'${key}' missing or not a number`);
   };
 }

@@ -18,7 +18,8 @@
  *  own kernels (kernels.ts) on the runntime device. Bind groups are built
  *  once; a step writes one 16-byte uniform and encodes one compute pass. */
 
-import type { RangeSource, SafeTensorInfo } from '../../core/index.ts';
+import { RunntimeError, type RangeSource, type SafeTensorInfo } from '../../core/index.ts';
+import { checkpointMismatch } from '../errors.ts';
 import type { DecoderConfig } from './config.ts';
 import {
   ARGMAX1_WGSL,
@@ -120,7 +121,7 @@ function toBf16Bytes(info: SafeTensorInfo, bytes: Uint8Array): Uint8Array {
             return o;
           })()
         : undefined;
-  if (!f32) throw new Error(`decoder: unsupported tensor dtype ${info.dtype}`);
+  if (!f32) throw checkpointMismatch('decoder weights', `unsupported tensor dtype ${info.dtype}`);
   const u = new Uint32Array(f32.buffer);
   const out = new Uint16Array(f32.length);
   for (let i = 0; i < u.length; i++) {
@@ -156,9 +157,10 @@ export async function loadDecoderEngine(
   const gemma = arch === 'gemma3';
   const maxContext = Math.min(opts.maxContext ?? 4096, cfg.maxPositions);
   const maxChunk = opts.maxChunk ?? 128;
-  if (D > 256 || D % 8 !== 0) throw new Error(`${arch}: headDim ${D} unsupported`);
+  if (D > 256 || D % 8 !== 0)
+    throw checkpointMismatch(`${arch} config`, `headDim ${D} unsupported`);
   for (const k of [hidden, ffn, H * D]) {
-    if (k % 32 !== 0) throw new Error(`${arch}: width ${k} not a multiple of 32`);
+    if (k % 32 !== 0) throw checkpointMismatch(`${arch} config`, `width ${k} not a multiple of 32`);
   }
   const QKVW = (H + 2 * KVH) * D;
 
@@ -189,12 +191,12 @@ export async function loadDecoderEngine(
       // multimodal checkpoints name the decoder model.language_model.*
       const t = weights.tensors.get(n.replace(/^model\./, 'model.language_model.'));
       if (t) return t;
-      throw new Error(`${arch} weights: missing tensor '${n}'`);
+      throw checkpointMismatch(`${arch} weights`, `missing tensor '${n}'`);
     };
     const expectShape = (n: string, shape: number[]) => {
       const t = name(n);
       if (JSON.stringify(t.shape) !== JSON.stringify(shape)) {
-        throw new Error(`${arch} weights: '${n}' is [${t.shape}], expected [${shape}]`);
+        throw checkpointMismatch(`${arch} weights`, `'${n}' is [${t.shape}], expected [${shape}]`);
       }
       return t;
     };
@@ -235,7 +237,9 @@ export async function loadDecoderEngine(
     };
     const checkAbort = () => {
       if (opts.signal?.aborted)
-        throw new Error('model load aborted', { cause: opts.signal.reason });
+        throw new RunntimeError('LOAD_ABORTED', 'model load aborted', {
+          cause: opts.signal.reason,
+        });
     };
 
     /** Reads [rowStart, rowEnd) of a 2D tensor as bf16 bytes. */
@@ -609,11 +613,18 @@ export async function loadDecoderEngine(
     const forward = async (tokenIds: readonly number[], pos0: number, wantLogits = false) => {
       const m = tokenIds.length;
       if (m < 1 || m > maxChunk)
-        throw new Error(`${arch}: forward takes 1..${maxChunk} tokens, got ${m}`);
+        throw new RunntimeError(
+          'INVALID_ARGUMENT',
+          `${arch}: forward takes 1..${maxChunk} tokens, got ${m}`,
+        );
       if (pos0 + m > maxContext) {
-        throw new Error(`${arch}: position ${pos0 + m} exceeds maxContext ${maxContext}`);
+        throw new RunntimeError(
+          'INVALID_ARGUMENT',
+          `${arch}: position ${pos0 + m} exceeds maxContext ${maxContext}`,
+        );
       }
-      if (busy) throw new Error(`${arch}: forward() calls must not overlap`);
+      if (busy)
+        throw new RunntimeError('INVALID_ARGUMENT', `${arch}: forward() calls must not overlap`);
       busy = true;
       try {
         stepData[0] = m;
@@ -645,11 +656,19 @@ export async function loadDecoderEngine(
      *  argmax feeds the next on the GPU. Resolves to the n argmax ids (the
      *  last is not fed). */
     const decodeGreedy = async (first: number, pos0: number, n: number): Promise<number[]> => {
-      if (n < 1 || n > MAX_BURST) throw new Error(`${arch}: burst of ${n} outside 1..${MAX_BURST}`);
+      if (n < 1 || n > MAX_BURST)
+        throw new RunntimeError(
+          'INVALID_ARGUMENT',
+          `${arch}: burst of ${n} outside 1..${MAX_BURST}`,
+        );
       if (pos0 + n > maxContext) {
-        throw new Error(`${arch}: position ${pos0 + n} exceeds maxContext ${maxContext}`);
+        throw new RunntimeError(
+          'INVALID_ARGUMENT',
+          `${arch}: position ${pos0 + n} exceeds maxContext ${maxContext}`,
+        );
       }
-      if (busy) throw new Error(`${arch}: forward() calls must not overlap`);
+      if (busy)
+        throw new RunntimeError('INVALID_ARGUMENT', `${arch}: forward() calls must not overlap`);
       busy = true;
       try {
         const steps = new Uint32Array((stepStride / 4) * n);

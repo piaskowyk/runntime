@@ -1,6 +1,7 @@
 /** Qwen 3 dense text-decoder architecture config, read from a Hugging Face
  *  config.json (`model_type: qwen3`) or given inline. */
 
+import { checkpointMismatch } from '../errors.ts';
 import { numReader, type DecoderConfig, type Json } from '../decoder/config.ts';
 
 /** A DecoderConfig with `arch: 'qwen3'`. */
@@ -11,11 +12,13 @@ export function qwen3ConfigFromJson(json: Json): Qwen3Config {
   const num = numReader(json, 'qwen3');
   const act = json.hidden_act;
   if (act !== undefined && act !== 'silu') {
-    throw new Error(`qwen3 config: activation '${String(act)}' unsupported`);
+    throw checkpointMismatch('qwen3 config', `activation '${String(act)}' unsupported`);
   }
-  if (json.attention_bias === true) throw new Error('qwen3 config: attention_bias unsupported');
-  if (json.use_sliding_window === true) throw new Error('qwen3 config: sliding window unsupported');
-  if (json.rope_scaling) throw new Error('qwen3 config: rope_scaling unsupported');
+  if (json.attention_bias === true)
+    throw checkpointMismatch('qwen3 config', 'attention_bias unsupported');
+  if (json.use_sliding_window === true)
+    throw checkpointMismatch('qwen3 config', 'sliding window unsupported');
+  if (json.rope_scaling) throw checkpointMismatch('qwen3 config', 'rope_scaling unsupported');
   const layers = num('num_hidden_layers');
   const hidden = num('hidden_size');
   const heads = num('num_attention_heads');

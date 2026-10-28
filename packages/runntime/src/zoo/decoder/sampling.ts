@@ -1,6 +1,8 @@
 /** Next-token selection on the CPU: greedy, or temperature sampling over
  *  the top-k tokens cut to a top-p nucleus, with a seedable generator. */
 
+import { RunntimeError } from '../../core/index.ts';
+
 /** mulberry32. */
 export function rng(seed: number): () => number {
   let a = seed >>> 0;
@@ -35,7 +37,7 @@ export function sampleToken(
         best = id;
       }
     }
-    if (best < 0) throw new Error('generate: every token is masked');
+    if (best < 0) throw new RunntimeError('INVALID_ARGUMENT', 'generate: every token is masked');
     return best;
   }
   // Top-k by a small sorted buffer (k is small, V is large).
@@ -60,7 +62,8 @@ export function sampleToken(
     vals[j] = v;
     ids[j] = id;
   }
-  if (ids.length === 0) throw new Error('generate: every token is masked');
+  if (ids.length === 0)
+    throw new RunntimeError('INVALID_ARGUMENT', 'generate: every token is masked');
   const max = vals[0]!;
   const probs = vals.map((v) => Math.exp((v - max) / temperature));
   const total = probs.reduce((a, b) => a + b, 0);

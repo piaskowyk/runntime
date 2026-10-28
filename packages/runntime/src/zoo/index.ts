@@ -44,7 +44,6 @@ export {
   type ChatTemplateOptions,
   type DecoderConfig,
   type Gemma3Config,
-  type Gemma3Tokenizer,
   type GenerateOptions,
   type GenerationStats,
   type LogitsContext,

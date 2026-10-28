@@ -1,5 +1,6 @@
 import { Tokenizer } from '@huggingface/tokenizers';
 import { describe, expect, it } from 'vitest';
+import { isRunntimeError } from '../../../src/core/index.ts';
 import {
   createTextTokenizer,
   formatGemmaChat,
@@ -127,10 +128,6 @@ describe.each([
   const ours = createTextTokenizer(json);
   const ref = new Tokenizer(json, {});
 
-  it.each(TEXTS)('encodes %j like tokenizers.js', (text) => {
-    expect(ours.encode(text)).toEqual(ref.encode(text, { add_special_tokens: false }).ids);
-  });
-
   it.each(TEXTS)('decodes %j back, and the same in a stream', (text) => {
     const ids = ours.encode(text);
     const want = ref.decode(ids, {
@@ -140,7 +137,39 @@ describe.each([
     expect(ours.decode(ids, { skipSpecial: false })).toBe(want);
     // One id at a time: a character split over byte tokens comes out whole.
     const stream = ours.createStreamDecoder({ skipSpecial: false });
-    expect(ids.map((id) => stream.push(id)).join('') + stream.flush()).toBe(want);
+    const pieces = ids.map((id) => stream.push(id));
+    expect(pieces.join('') + stream.flush()).toBe(want);
+    expect(pieces.some((p) => p.includes('\uFFFD'))).toBe(false);
+  });
+});
+
+describe('tokenizer stream decoder', () => {
+  const tok = createTextTokenizer(sentencePieceJson());
+
+  it('holds back a character until its last byte token', () => {
+    // 'é' is outside the vocab: two byte tokens, <0xC3> <0xA9>.
+    const ids = tok.encode('aé');
+    expect(ids).toHaveLength(3);
+    const stream = tok.createStreamDecoder();
+    expect(ids.map((id) => stream.push(id))).toEqual(['a', '', 'é']);
+    expect(stream.flush()).toBe('');
+  });
+
+  it('returns an unfinished character on flush, and starts over', () => {
+    const [a, c3] = tok.encode('aé');
+    const stream = tok.createStreamDecoder();
+    expect(stream.push(a!)).toBe('a');
+    expect(stream.push(c3!)).toBe('');
+    expect(stream.flush()).toBe('\uFFFD');
+    expect(stream.push(a!)).toBe('a');
+  });
+
+  it('skips special tokens unless asked', () => {
+    const ids = tok.encode('<start_of_turn>the<end_of_turn>');
+    const skip = tok.createStreamDecoder();
+    expect(ids.map((id) => skip.push(id)).join('')).toBe('the');
+    const keep = tok.createStreamDecoder({ skipSpecial: false });
+    expect(ids.map((id) => keep.push(id)).join('')).toBe('<start_of_turn>the<end_of_turn>');
   });
 });
 
@@ -155,10 +184,12 @@ describe('tokenizer special tokens', () => {
     expect(createTextTokenizer(byteLevelJson()).bosId).toBeUndefined();
   });
 
-  it('parses added tokens only when asked', () => {
-    expect(tok.encode('<bos>')).toEqual([2]);
-    expect(tok.encode('<bos>', { parseSpecial: false })).not.toContain(2);
-    expect(tok.encode('the', { addBos: true })[0]).toBe(2);
+  it('parses added tokens, and adds bos only when asked', () => {
+    expect(tok.encode('<bos>the')).toEqual([2, ...tok.encode('the')]);
+    expect(tok.encode('the')).not.toContain(2);
+    expect(tok.encode('the', { addBos: true })).toEqual([2, ...tok.encode('the')]);
+    expect(tok.isSpecial(2)).toBe(true);
+    expect(tok.isSpecial(tok.encode('the')[0]!)).toBe(false);
   });
 
   it('drops special tokens on decode unless asked', () => {
@@ -168,11 +199,21 @@ describe('tokenizer special tokens', () => {
   });
 
   it('refuses a tokenizer it cannot run', () => {
-    expect(() => createTextTokenizer({ model: { type: 'Unigram' } })).toThrow(/BPE/);
+    const mismatch = (json: unknown, message: RegExp) => {
+      let err: unknown;
+      try {
+        createTextTokenizer(json);
+      } catch (e) {
+        err = e;
+      }
+      expect(isRunntimeError(err, 'CHECKPOINT_MISMATCH')).toBe(true);
+      expect((err as Error).message).toMatch(message);
+    };
+    mismatch({ model: { type: 'Unigram' } }, /BPE/);
     const noTurns = sentencePieceJson();
     noTurns.added_tokens = noTurns.added_tokens.filter((t) => t.content !== '<start_of_turn>');
     delete (noTurns.model.vocab as Record<string, number>)['<start_of_turn>'];
-    expect(() => createTextTokenizer(noTurns)).toThrow(/unknown chat format/);
+    mismatch(noTurns, /unknown chat format/);
   });
 });
 

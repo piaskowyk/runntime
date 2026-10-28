@@ -147,6 +147,9 @@ describe('decoder engine weights', () => {
     await expect(loadDecoderEngine(device, wrong, { tensors, source })).rejects.toThrow(
       /'model\.layers\.0\.mlp\.gate_proj\.weight' is \[96,64\], expected \[64,64\]/,
     );
+    await expect(loadDecoderEngine(device, wrong, { tensors, source })).rejects.toThrow(
+      expect.objectContaining({ code: 'CHECKPOINT_MISMATCH' }),
+    );
     expect(buffersSince(before)).toEqual([]);
   });
 });

@@ -1,6 +1,7 @@
 /** Gemma 3 text-decoder architecture config, read from a Hugging Face
  *  config.json (`model_type: gemma3_text`) or given inline. */
 
+import { checkpointMismatch } from '../errors.ts';
 import { numReader, type DecoderConfig, type Json } from '../decoder/config.ts';
 
 /** A DecoderConfig with `arch: 'gemma3'`. */
@@ -13,16 +14,18 @@ export function gemma3ConfigFromJson(raw: Json): Gemma3Config {
   const num = numReader(json, 'gemma3');
   const act = json.hidden_activation ?? json.hidden_act;
   if (act !== undefined && act !== 'gelu_pytorch_tanh') {
-    throw new Error(`gemma3 config: activation '${String(act)}' unsupported`);
+    throw checkpointMismatch('gemma3 config', `activation '${String(act)}' unsupported`);
   }
-  if (json.attention_bias === true) throw new Error('gemma3 config: attention_bias unsupported');
+  if (json.attention_bias === true)
+    throw checkpointMismatch('gemma3 config', 'attention_bias unsupported');
   const layers = num('num_hidden_layers');
   const hidden = num('hidden_size');
   const heads = num('num_attention_heads');
   let sliding: boolean[];
   if (Array.isArray(json.layer_types)) {
     sliding = (json.layer_types as string[]).map((t) => t === 'sliding_attention');
-    if (sliding.length !== layers) throw new Error('gemma3 config: layer_types length mismatch');
+    if (sliding.length !== layers)
+      throw checkpointMismatch('gemma3 config', 'layer_types length mismatch');
   } else {
     const pattern = num('sliding_window_pattern', (json._sliding_window_pattern as number) ?? 6);
     sliding = Array.from({ length: layers }, (_, i) => (i + 1) % pattern !== 0);
@@ -32,7 +35,7 @@ export function gemma3ConfigFromJson(raw: Json): Gemma3Config {
   if (scaling) {
     const type = scaling.rope_type ?? scaling.type;
     if (type !== 'linear' && type !== 'default') {
-      throw new Error(`gemma3 config: rope_scaling type '${String(type)}' unsupported`);
+      throw checkpointMismatch('gemma3 config', `rope_scaling type '${String(type)}' unsupported`);
     }
     if (type === 'linear') ropeScale = scaling.factor as number;
   }

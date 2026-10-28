@@ -10,8 +10,11 @@ import {
   httpRangeSource,
   inGpuErrorScopes,
   parseSafetensorsHeader,
+  RunntimeError,
+  warmUp,
   type RangeSource,
 } from '../../../core/index.ts';
+import { asLoadError, checkpointMismatch, rethrowRunError } from '../../errors.ts';
 import { fetchJson, throwIfAborted, type LoadOptions, type ModelPath } from '../../load.ts';
 import type { DecoderConfig, Json } from '../../decoder/config.ts';
 import { loadDecoderEngine, MAX_BURST, type DecoderEngine } from '../../decoder/engine.ts';
@@ -20,7 +23,6 @@ import {
   createTextTokenizer,
   type ChatMessage,
   type ChatTemplateOptions,
-  type Gemma3Tokenizer,
   type TextTokenizer,
 } from '../../decoder/tokenizer.ts';
 import { gemma3ConfigFromJson, type Gemma3Config } from '../../gemma3/config.ts';
@@ -32,20 +34,19 @@ export type {
   ChatTemplateOptions,
   DecoderConfig,
   Gemma3Config,
-  Gemma3Tokenizer,
   Qwen3Config,
   TextTokenizer,
 };
 
 /** Parses a Hugging Face config.json of a supported decoder (model_type
- *  gemma3 / gemma3_text / qwen3). */
+ *  gemma3 / gemma3_text / qwen3). Throws CHECKPOINT_MISMATCH for any other. */
 export function decoderConfigFromJson(json: Json): DecoderConfig {
   const type = json.model_type;
   if (type === 'qwen3') return qwen3ConfigFromJson(json);
   if (type === 'gemma3' || type === 'gemma3_text' || type === undefined) {
     return gemma3ConfigFromJson(json);
   }
-  throw new Error(`createTextGenerator: model_type '${String(type)}' unsupported`);
+  throw checkpointMismatch('text generation config', `model_type '${String(type)}' unsupported`);
 }
 
 /** What to load. */
@@ -145,8 +146,15 @@ export interface TextGenerator {
   dispose(): void;
 }
 
-const abortError = (signal: AbortSignal): unknown =>
-  signal.reason ?? new DOMException('generation aborted', 'AbortError');
+const isMessages = (v: unknown): v is readonly ChatMessage[] =>
+  Array.isArray(v) &&
+  v.every(
+    (m: unknown) =>
+      typeof m === 'object' &&
+      m !== null &&
+      typeof (m as ChatMessage).role === 'string' &&
+      typeof (m as ChatMessage).content === 'string',
+  );
 
 /** Length of the longest end of `text` that a stop string starts with
  *  (shorter than the whole stop string, which would have matched). */
@@ -184,6 +192,31 @@ export async function createTextGenerator(
   model: TextGeneratorModel = models.textGeneration.GEMMA3_1B_IT,
   opts: TextGeneratorOptions = {},
 ): Promise<TextGenerator> {
+  try {
+    return await loadTextGenerator(model, opts);
+  } catch (err) {
+    throw asLoadError(err, opts.signal);
+  }
+}
+
+/** Checks a size option: undefined, or an integer in min..max. */
+function checkSize(name: string, value: number | undefined, min: number, max = Infinity) {
+  if (value === undefined) return;
+  if (!Number.isInteger(value) || value < min || value > max) {
+    const range = max === Infinity ? `≥ ${min}` : `in ${min}..${max}`;
+    throw new RunntimeError(
+      'INVALID_ARGUMENT',
+      `${name} must be an integer ${range}, got ${value}`,
+    );
+  }
+}
+
+async function loadTextGenerator(
+  model: TextGeneratorModel,
+  opts: TextGeneratorOptions,
+): Promise<TextGenerator> {
+  checkSize('maxContext', opts.maxContext, 1);
+  checkSize('prefillChunk', opts.prefillChunk, 1);
   const device = defaultRoot().device;
   const base =
     opts.cacheId ??
@@ -191,7 +224,9 @@ export async function createTextGenerator(
     (typeof model.modelPath === 'string'
       ? model.modelPath.replace(/^https?:\/\//, '').replace(/\/model\.safetensors$/, '')
       : undefined);
-  if (opts.cache && !base) throw new Error('createTextGenerator: a cache needs a cacheId');
+  if (opts.cache && !base) {
+    throw new RunntimeError('INVALID_ARGUMENT', 'createTextGenerator: a cache needs a cacheId');
+  }
   const cfg =
     typeof model.config === 'string'
       ? decoderConfigFromJson(
@@ -222,12 +257,8 @@ export async function createTextGenerator(
   let defaultBurst = 1;
   try {
     const first = tokenizer.bosId ?? tokenizer.eosId;
-    const warm = await inGpuErrorScopes(device, `${cfg.arch} warm-up`, () =>
-      engine.forward([first], 0, true),
-    );
-    if (!warm.every(Number.isFinite) || warm.every((v) => v === 0)) {
-      throw new Error(`${cfg.arch} warm-up produced unusable logits on this device`);
-    }
+    throwIfAborted(opts.signal);
+    await warmUp(device, () => engine.forward([first], 0, true), `${cfg.arch} warm-up`);
     cached = [first];
     highWater = 1;
     // GPU→CPU round-trip latency decides the default greedy burst: ~0.1 ms
@@ -261,7 +292,8 @@ export async function createTextGenerator(
    *  resolves to the logits after the last id. */
   const prefill = async (ids: number[], reuse: boolean, signal?: AbortSignal) => {
     if (ids.length > engine.maxContext) {
-      throw new Error(
+      throw new RunntimeError(
+        'INVALID_ARGUMENT',
         `generate: prompt is ${ids.length} tokens, maxContext is ${engine.maxContext}`,
       );
     }
@@ -276,7 +308,7 @@ export async function createTextGenerator(
     if (p === 0) highWater = 0;
     let logits: Float32Array | undefined;
     while (p < ids.length) {
-      if (signal?.aborted) throw abortError(signal);
+      if (signal?.aborted) throw signal.reason;
       const part = ids.slice(p, p + engine.maxChunk);
       const last = p + part.length >= ids.length;
       if (last) logits = await engine.forward(part, p, true);
@@ -300,6 +332,15 @@ export async function createTextGenerator(
     input: string | readonly ChatMessage[],
     o: GenerateOptions,
   ): Promise<string> => {
+    checkSize('generate: maxNewTokens', o.maxNewTokens, 1);
+    checkSize('generate: topK', o.topK, 1);
+    checkSize('generate: decodeBurst', o.decodeBurst, 1, MAX_BURST);
+    if (o.temperature !== undefined && !(o.temperature >= 0)) {
+      throw new RunntimeError('INVALID_ARGUMENT', 'generate: temperature must be ≥ 0');
+    }
+    if (o.topP !== undefined && !(o.topP > 0 && o.topP <= 1)) {
+      throw new RunntimeError('INVALID_ARGUMENT', 'generate: topP must be in (0, 1]');
+    }
     const ids = toIds(input, o.raw, o.chatTemplate);
     const maxNew = o.maxNewTokens ?? 256;
     const temperature = o.temperature ?? 0;
@@ -318,7 +359,7 @@ export async function createTextGenerator(
     let tFirst = t1;
     // Greedy with no CPU-side logit hooks: argmax on the GPU, in bursts.
     const gpuGreedy = temperature <= 0 && !o.logitsProcessor && o.allowedTokenIds === undefined;
-    const burst = Math.max(1, Math.min(o.decodeBurst ?? defaultBurst, MAX_BURST));
+    const burst = o.decodeBurst ?? defaultBurst;
     // Burst output not consumed yet; `fed` ids already have their K/V cached.
     let pending: { id: number; fed: boolean }[] = [];
     try {
@@ -413,26 +454,42 @@ export async function createTextGenerator(
         finishReason,
       };
     }
-    if (finishReason === 'aborted') throw abortError(o.signal!);
+    if (finishReason === 'aborted') throw o.signal!.reason;
     return text;
   };
 
   let inFlight: Promise<unknown> = Promise.resolve();
   let disposed = false;
-  const serialize = <T>(job: () => Promise<T>): Promise<T> => {
-    if (disposed) return Promise.reject(new Error('text generator is disposed'));
+  // Calls run one after another: they share the KV cache. Errors become
+  // RunntimeErrors, except an abort, which rejects with the signal's reason
+  // like fetch() does.
+  const serialize = async <T>(
+    input: unknown,
+    job: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> => {
+    if (disposed) throw new RunntimeError('RESOURCE_DISPOSED', 'text generator is disposed');
+    if (typeof input !== 'string' && !isMessages(input)) {
+      throw new RunntimeError(
+        'INVALID_ARGUMENT',
+        'generate: input must be a string or an array of { role, content } messages',
+      );
+    }
     const p = inFlight.then(job);
     inFlight = p.catch(() => undefined);
-    return p;
+    return p.catch((err: unknown) => {
+      if (signal?.aborted && err === signal.reason) throw err;
+      return rethrowRunError(err);
+    });
   };
 
   const generator: TextGenerator = {
     tokenizer,
     config: cfg,
     maxContext: engine.maxContext,
-    generate: (input, o = {}) => serialize(() => run(input, o)),
+    generate: (input, o = {}) => serialize(input, () => run(input, o), o.signal),
     logits: (input, o = {}) =>
-      serialize(async () => {
+      serialize(input, async () => {
         const l = (await prefill(toIds(input, o.raw, o.chatTemplate), true)).logits;
         prepare(l);
         return l;

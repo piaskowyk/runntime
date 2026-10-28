@@ -28,8 +28,10 @@ function tinyTokenizerJson(vocabSize: number) {
   for (let i = tokens.length; i < vocabSize; i++) tokens.push(`tok${i}`);
   return {
     added_tokens: SPECIALS.map((content, id) => ({ id, content, special: true })),
-    normalizer: null,
+    normalizer: { type: 'Replace', pattern: { String: ' ' }, content: '▁' },
     pre_tokenizer: null,
+    post_processor: null,
+    decoder: { type: 'Replace', pattern: { String: '▁' }, content: ' ' },
     model: {
       type: 'BPE',
       vocab: Object.fromEntries(tokens.map((t, i) => [t, i])),
@@ -190,9 +192,85 @@ describe('createTextGenerator', () => {
     const gen = await load();
     await run(gen, { decodeBurst: 4 });
     gen.dispose();
-    await expect(gen.generate(chat)).rejects.toThrow(/disposed/);
+    await expect(gen.generate(chat)).rejects.toThrow(
+      expect.objectContaining({ code: 'RESOURCE_DISPOSED' }),
+    );
     // dispose waits for the queue of calls, which is empty here.
     await Promise.resolve();
+    expect(buffersSince(before)).toEqual([]);
+  });
+
+  it('refuses wrong generate arguments, and runs the next call', async () => {
+    const gen = await load();
+    try {
+      const wrong: [string, unknown, GenerateOptions][] = [
+        ['maxNewTokens 0', chat, { maxNewTokens: 0 }],
+        ['topK 0', chat, { temperature: 1, topK: 0 }],
+        ['topP 0', chat, { temperature: 1, topP: 0 }],
+        ['topP above 1', chat, { temperature: 1, topP: 1.5 }],
+        ['a negative temperature', chat, { temperature: -1 }],
+        ['a burst above 32', chat, { decodeBurst: 33 }],
+        ['a number as input', 42, {}],
+        ['a message without content', [{ role: 'user' }], {}],
+        ['every token masked', chat, { allowedTokenIds: [] }],
+        ['a prompt past maxContext', 'the '.repeat(200), {}],
+      ];
+      for (const [name, input, opts] of wrong) {
+        await expect(
+          gen.generate(input as string, { maxNewTokens: 4, ...opts }),
+          name,
+        ).rejects.toThrow(expect.objectContaining({ code: 'INVALID_ARGUMENT' }));
+      }
+      expect((await run(gen)).ids.length).toBeGreaterThan(0);
+    } finally {
+      gen.dispose();
+    }
+  });
+});
+
+describe('createTextGenerator load errors', () => {
+  const jsonUrl = (json: unknown) =>
+    URL.createObjectURL(new Blob([JSON.stringify(json)], { type: 'application/json' }));
+  const weights = { modelPath: bufferSource(model.file), tokenizerPath: tokenizerUrl };
+
+  it.each([
+    {
+      name: 'a maxContext of 0',
+      model: { ...weights, config: cfg },
+      opts: { maxContext: 0 },
+      code: 'INVALID_ARGUMENT',
+    },
+    {
+      name: 'an unsupported model_type',
+      model: { ...weights, config: jsonUrl({ model_type: 'llama' }) },
+      code: 'CHECKPOINT_MISMATCH',
+    },
+    {
+      name: 'weights of another shape',
+      model: { ...weights, config: { ...cfg, ffn: 64 } },
+      code: 'CHECKPOINT_MISMATCH',
+    },
+    {
+      name: 'a tokenizer that is not BPE',
+      model: { ...weights, tokenizerPath: jsonUrl({ model: { type: 'Unigram' } }), config: cfg },
+      code: 'CHECKPOINT_MISMATCH',
+    },
+    {
+      name: 'a tokenizer that cannot be fetched',
+      model: { ...weights, tokenizerPath: 'blob:null/missing', config: cfg },
+      code: 'LOAD_FAILED',
+    },
+    {
+      name: 'an aborted signal',
+      model: { ...weights, config: cfg },
+      opts: { signal: AbortSignal.abort() },
+      code: 'LOAD_ABORTED',
+    },
+  ])('throws $code for $name, leaving no buffers', async ({ model: m, opts, code }) => {
+    const before = liveBuffers();
+    await expect(createTextGenerator(m, { maxContext: 32, ...opts })).rejects.toThrow(
+      expect.objectContaining({ name: 'RunntimeError', code }),
+    );
     expect(buffersSince(before)).toEqual([]);
   });
 });
