@@ -38,6 +38,24 @@ export {
 } from './tasks/multimodal/embedding.ts';
 
 export {
+  createTextGenerator,
+  decoderConfigFromJson,
+  type ChatMessage,
+  type ChatTemplateOptions,
+  type DecoderConfig,
+  type Gemma3Config,
+  type Gemma3Tokenizer,
+  type GenerateOptions,
+  type GenerationStats,
+  type LogitsContext,
+  type Qwen3Config,
+  type TextGenerator,
+  type TextGeneratorModel,
+  type TextGeneratorOptions,
+  type TextTokenizer,
+} from './tasks/nlp/textGeneration.ts';
+
+export {
   createPrivacyFilter,
   type PrivacyFilter,
   type PrivacyFilterModel,

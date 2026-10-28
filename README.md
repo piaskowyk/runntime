@@ -134,6 +134,7 @@ from `models`, or spread one and change a field.
 | Task                  | Factory                   | Models                                |
 | --------------------- | ------------------------- | ------------------------------------- |
 | Embedding             | `createEmbedder`          | EmbeddingGemma 2, all-MiniLM-L6-v2    |
+| Text generation       | `createTextGenerator`     | Gemma 3 1B-it / 270M-it, Qwen3 0.6B   |
 | Privacy filter        | `createPrivacyFilter`     | OpenAI privacy-filter (int8)          |
 | Speech to text        | `createSpeechToText`      | Moonshine tiny / base, streaming tiny |
 | Object detection      | `createObjectDetector`    | YOLO26 n / m                          |
@@ -141,6 +142,52 @@ from `models`, or spread one and change a field.
 | Pose & keypoints      | `createKeypointDetector`  | YOLO26-pose n / m                     |
 | Depth estimation      | `createDepthEstimator`    | DepthART s / b                        |
 | Image classification  | `createImageClassifier`   | MobileNetV4 small                     |
+
+### Text generation
+
+```ts
+import { createTextGenerator, models } from 'runntime/zoo';
+
+const llm = await createTextGenerator(models.textGeneration.GEMMA3_1B_IT);
+const reply = await llm.generate(
+  [
+    { role: 'system', content: 'Answer in one sentence.' },
+    { role: 'user', content: 'What is the capital of France?' },
+  ],
+  { maxNewTokens: 128, onToken: (text) => console.log(text) },
+);
+```
+
+`generate()` takes chat messages (or a prompt string), streams through
+`onToken`, samples with `temperature` / `topK` / `topP` (greedy by default),
+and accepts a `logitsProcessor` or `allowedTokenIds` to constrain every step,
+e.g. for JSON output. Turns of one conversation reuse the KV cache of the
+shared prefix. Activations and the KV cache are f32 (Gemma overflows f16);
+weights stay bf16 and need no `shader-f16`.
+
+Qwen 3 uses the same API with the ChatML template. Thinking is off by default
+(an empty `<think></think>` block is pre-filled); pass
+`chatTemplate: { enableThinking: true }` to turn it on, or
+`chatTemplate: { tools }` to list function schemas the way the model was
+trained to read them:
+
+```ts
+const qwen = await createTextGenerator(models.textGeneration.QWEN3_0_6B);
+const call = await qwen.generate([{ role: 'user', content: 'Mute Bob.' }], {
+  chatTemplate: {
+    tools: [
+      {
+        type: 'function',
+        function: {
+          name: 'mute_user',
+          parameters: { type: 'object', properties: { user: { type: 'string' } } },
+        },
+      },
+    ],
+  },
+});
+// '<tool_call>\n{"name": "mute_user", "arguments": {"user": "Bob"}}\n</tool_call>'
+```
 
 ## Coming from transformers.js
 
